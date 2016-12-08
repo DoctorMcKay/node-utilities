@@ -92,7 +92,7 @@ function cloudflare(method, endpoint, data, callback) {
 		data = {};
 	}
 	
-	var headers = {"X-Auth-Email": CF_EMAIL, "X-Auth-Key": CF_TOKEN};
+	var headers = {"X-Auth-Email": CF_EMAIL, "X-Auth-Key": CF_KEY};
 	if (method != "GET") {
 		headers['Content-Type'] = "application/json";
 	}
