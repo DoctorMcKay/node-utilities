@@ -1,126 +1,140 @@
 /**
- * This script will automatically update a CloudFlare-hosted DNS entry with your current local IP address.
+ * This script will automatically update a Cloudflare-hosted DNS entry with your current local IP address.
  * Useful as a dynamic DNS host.
  */
 
-const CF_EMAIL = "";                 // Your CloudFlare account email
-const CF_KEY = "";                   // Your CloudFlare API key
+const CF_EMAIL = "";                 // Your Cloudflare account email
+const CF_KEY = "";                   // Your Cloudflare API key
 const DOMAIN = "";                   // The domain you wish to point to your local IP       
 const DNS_TTL = 120;                 // TTL for your subdomain
 
 // DO NOT EDIT BELOW THIS LINE
 
-var Https = require('https');
+const DNS = require('dns');
+const HTTPS = require('https');
 
-console.log("Getting local IPv4 address from ipv4.icanhazip.com...");
-Https.get("https://ipv4.icanhazip.com", (res) => {
-	if (res.statusCode != 200) {
-		throw new Error("HTTP error " + res.statusCode + " from icanhazip.com");
+main();
+async function main() {
+	let localIp = await getMyIp();
+	console.log(`Local IPv4 address is ${localIp}`);
+	
+	let domainIp = await resolve4(DOMAIN);
+	console.log(`${DOMAIN} points to ${domainIp[0] || 'NOWHERE'}`);
+	
+	if (domainIp.length == 1 && localIp == domainIp[0]) {
+		console.log(`${DOMAIN} already points to our local IP; exiting`);
+		return;
 	}
 	
-	if (!res.headers['content-type'] || !res.headers['content-type'].match(/^text\/plain($|;)/)) {
-		throw new Error("Missing or bad content-type " + res.headers['content-type'] + " from icanhazip.com");
+	
+	console.log('Listing Cloudflare zones...');
+	
+	var domainPortions = [];
+	var domainParts = DOMAIN.split('.');
+	for (var i = domainParts.length - 2; i >= 0; i--) {
+		domainPortions.push(domainParts.slice(i).join('.'));
 	}
 	
-	var data = "";
-	res.on('data', (chunk) => data += chunk);
-	res.on('end', () => {
-		data = data.trim();
-		if (!data.match(/^(\d{1,3}\.){3}\d{1,3}$/)) {
-			throw new Error("Malformed response data " + data + " from icanhazip.com");
+	let zones = await cloudflare('GET', '/zones');
+	let zone = zones.find(z => domainPortions.includes(z.name));
+	
+	if (!zone) {
+		throw new Error(`Cannot find a zone matching ${DOMAIN} in your Cloudflare account`);
+	}
+	
+	let zoneId = zone.id;
+	console.log(`Found zone ID: ${zoneId}`);
+	console.log('Listing DNS records for zone...');
+	
+	let dnsRecords = await cloudflare('GET', `/zones/${zoneId}/dns_records?name=${DOMAIN}`);
+	if (dnsRecords.length == 0) {
+		console.log('No DNS record found; creating one...');
+		await createRecord(zoneId, localIp);
+	} else if (dnsRecords[0].content == localIp) {
+		// This shouldn't really happen since we check via DNS early, but maybe there's some caching going on
+		console.log(`DNS record for ${DOMAIN} is already current IP ${localIp}; exiting`);
+		return;
+	} else {
+		console.log(`Updating existing DNS record ${dnsRecords[0].id}...`);
+		await updateRecord(zoneId, dnsRecords[0].id, localIp);
+	}
+}
+
+async function createRecord(zoneId, localIp) {
+	let record = await cloudflare('POST', `/zones/${zoneId}/dns_records`, {type: 'A', name: DOMAIN, content: localIp});
+	console.log(`DNS record ${record.id} created for domain ${DOMAIN} with IP ${localIp}`);
+}
+
+async function updateRecord(zoneId, recordId, localIp) {
+	let record = await cloudflare('PUT', `/zones/${zoneId}/dns_records/${recordId}`, {type: 'A', name: DOMAIN, content: localIp});
+	console.log(`DNS record ${record.id} updated for domain ${DOMAIN} with IP ${localIp}`);
+}
+
+function cloudflare(method, endpoint, data) {
+	return new Promise((resolve, reject) => {
+		let headers = {'X-Auth-Email': CF_EMAIL, 'X-Auth-Key': CF_KEY};
+		if (method != 'GET') {
+			headers['Content-Type'] = 'application/json';
 		}
 		
-		var localIp = data;
-		
-		console.log("Local IP is " + localIp);
-		console.log("Listing CloudFlare zones...");
-		
-		var domainPortions = [];
-		var domainParts = DOMAIN.split('.');
-		for (var i = domainParts.length - 2; i >= 0; i--) {
-			domainPortions.push(domainParts.slice(i).join('.'));
-		}
-		
-		cloudflare("GET", "/zones", (res) => {
-			var zone = null;
-			
-			for (var i = 0; i < res.length; i++) {
-				if (domainPortions.indexOf(res[i].name) != -1) {
-					zone = res[i].id;
-					break;
-				}
+		HTTPS.request({
+			method,
+			hostname: 'api.cloudflare.com',
+			port: 443,
+			path: '/client/v4' + endpoint,
+			headers
+		}, (res) => {
+			if (res.statusCode != 200) {
+				return reject(new Error(`HTTP error ${res.statusCode} from Cloudflare`));
 			}
 			
-			if (!zone) {
-				throw new Error("Cannot find zone matching domain");
-			}
-			
-			console.log("Got zone ID: " + zone);
-			console.log("Listing DNS records for zone...");
-			
-			cloudflare("GET", "/zones/" + zone + "/dns_records?name=" + DOMAIN, (res) => {
-				if (res.length == 0) {
-					console.log("No DNS record found; creating one...");
-					createRecord(zone, localIp);
-				} else if (res[0].content == localIp) {
-					console.log("DNS record for " + DOMAIN + " is already current IP " + localIp + "; exiting");
-					return;
-				} else {
-					console.log("Updating existing DNS record " + res[0].id + "...");
-					updateRecord(zone, res[0].id, localIp);
+			var data = '';
+			res.on('data', (chunk) => data += chunk);
+			res.on('end', () => {
+				data = JSON.parse(data);
+				if (!data.success) {
+					if (data.errors && data.errors.length > 0) {
+						return reject(new Error(data.errors.join(', ')));
+					} else {
+						return reject(new Error('Non-success from Cloudflare'));
+					}
 				}
+				
+				resolve(data.result);
 			});
-		});
-	});
-});
-
-function createRecord(zoneId, localIp) {
-	cloudflare("POST", "/zones/" + zoneId + "/dns_records", {"type": "A", "name": DOMAIN, "content": localIp}, (res) => {
-		console.log("DNS record " + res.id + " created for domain " + DOMAIN + " with IP " + localIp);
+		}).end(method == 'GET' ? null : JSON.stringify(data));
 	});
 }
 
-function updateRecord(zoneId, recordId, localIp) {
-	cloudflare("PUT", "/zones/" + zoneId + "/dns_records/" + recordId, {"type": "A", "name": DOMAIN, "content": localIp}, (res) => {
-		console.log("DNS record " + res.id + " updated for domain " + DOMAIN + " with IP " + localIp);
-	});
-}
-
-function cloudflare(method, endpoint, data, callback) {
-	if (typeof data === 'function') {
-		callback = data;
-		data = {};
-	}
-	
-	var headers = {"X-Auth-Email": CF_EMAIL, "X-Auth-Key": CF_KEY};
-	if (method != "GET") {
-		headers['Content-Type'] = "application/json";
-	}
-	
-	Https.request({
-		"method": method,
-		"hostname": "api.cloudflare.com",
-		"port": 443,
-		"path": "/client/v4" + endpoint,
-		"headers": headers
-	}, (res) => {
-		if (res.statusCode != 200) {
-			throw new Error("HTTP error " + res.statusCode + " from CloudFlare");
-		}
-		
-		var data = "";
-		res.on('data', (chunk) => data += chunk);
-		res.on('end', () => {
-			data = JSON.parse(data);
-			if (!data.success) {
-				if (data.errors && data.errors.length > 0) {
-					throw new Error(data.errors.join(', '));
-				} else {
-					throw new Error("Non-success from CloudFlare");
+function resolve4(domain) {
+	return new Promise((resolve, reject) => {
+		let resolver = new DNS.Resolver();
+		resolver.setServers(['1.1.1.1', '1.0.0.1']); // manually specify resolvers to avoid any local caches
+		resolver.resolve4(domain, (err, addresses) => {
+			if (err) {
+				if (err.code == 'ENODATA') {
+					return resolve([]);
 				}
+				
+				return reject(err);
 			}
 			
-			callback(data.result);
+			resolve(addresses);
 		});
-	}).end(method == "GET" ? null : JSON.stringify(data));
+	});
+}
+
+function getMyIp() {
+	return new Promise(async (resolve, reject) => {
+		let resolver = new DNS.Resolver();
+		resolver.setServers(await resolve4('resolver1.opendns.com'));
+		resolver.resolve4('myip.opendns.com', (err, addresses) => {
+			if (err) return reject(err);
+			if (addresses.length == 0) {
+				return reject(new Error('No IP found'));
+			}
+			
+			resolve(addresses[0]);
+		});
+	});
 }
